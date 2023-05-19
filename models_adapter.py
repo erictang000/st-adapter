@@ -9,11 +9,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from qrnn import QRNN
+import einops
+
 from configs import (
     CLIP_VIT_B16_PATH,
     CLIP_VIT_L14_PATH,
     DWCONV3D_DISABLE_CUDNN,
     )
+
+QRNN_BIAS = 5
 
 class Adapter(nn.Module):
 
@@ -54,6 +59,39 @@ class Adapter(nn.Module):
         x_id[:, 1:, :] += x
         return x_id
 
+class QRNNAdapter(nn.Module):
+    def __init__(self, D_features, downsample_ratio=0.25, skip_connect=True, qrnn_bidirectional=False, qrnn_layers=1, qrnn_dropout=0.3):
+        super().__init__()
+        self.skip_connect = skip_connect
+        d_size = int(D_features * downsample_ratio)
+        self.qrnn = QRNN(D_features, d_size, num_layers=qrnn_layers, output_gate=False, bidirectional=qrnn_bidirectional, dropout=qrnn_dropout)
+        if qrnn_bidirectional:
+            self.qrnn_up = nn.Linear(d_size * 2, D_features)
+        else:
+            self.qrnn_up = nn.Linear(d_size, D_features)
+        
+        nn.init.constant_(self.qrnn_up.weight, 0.)
+        nn.init.constant_(self.qrnn_up.bias, 0.)
+
+        for layer in self.qrnn.layers:
+            new_weight_f = torch.zeros_like(layer.conv1d_f.weight)
+            new_bias_f = QRNN_BIAS + torch.zeros_like(layer.conv1d_f.bias)     # bias (eg.5) biases the network to ignore previous hidden.
+
+            layer.conv1d_f.weight = torch.nn.Parameter(new_weight_f, requires_grad=True)
+            layer.conv1d_f.bias = torch.nn.Parameter(new_bias_f, requires_grad=True)
+
+        
+    def forward(self, x, T):
+        BT, L, C = x.size()
+        B = BT // T
+        x_reshaped = einops.rearrange(x, "(b s) l d -> s (b l) d", b=B, s=T, l=L)  
+
+        qrnn_out, _ = self.qrnn(x_reshaped)       
+        adapter_out = self.qrnn_up(qrnn_out)
+        adapter_out = x_reshaped + adapter_out
+        
+        x = einops.rearrange(adapter_out, 's (b l) d -> (b s) l d', b=B, s=T, l=L)   
+        return x 
 
 class LayerNorm(nn.LayerNorm):
     """Subclass torch's LayerNorm to handle fp16."""
@@ -77,6 +115,7 @@ class ResidualAttentionBlock(nn.Module):
                  adapter_kernel_size: Tuple[int, int, int],
                  adapter_pre_attn: bool,
                  adapter_pre_mlp: bool,
+                 qrnn_adapter: bool
                  ) -> None:
         super().__init__()
 
@@ -89,12 +128,23 @@ class ResidualAttentionBlock(nn.Module):
         ]))
         self.ln_2 = LayerNorm(d_model)
 
-        adapter_class = functools.partial(
-            Adapter,
-            in_channels=d_model,
-            adapter_channels=adapter_width,
-            kernel_size=adapter_kernel_size,
-        )
+        if qrnn_adapter:
+            adapter_class = functools.partial(
+                QRNNAdapter,
+                D_features=d_model,
+                downsample_ratio=0.25,
+                skip_connect=True,
+                qrnn_bidirectional=False,
+                qrnn_layers=1,
+                qrnn_dropout=0.3
+            )   
+        else:
+            adapter_class = functools.partial(
+                Adapter,
+                in_channels=d_model,
+                adapter_channels=adapter_width,
+                kernel_size=adapter_kernel_size,
+            )
         self.adapter_pre_attn = \
             adapter_class() if adapter_pre_attn else None
         self.adapter_pre_mlp = \
@@ -107,7 +157,7 @@ class ResidualAttentionBlock(nn.Module):
         qkv = F.linear(x, weight=self.attn.in_proj_weight, bias=self.attn.in_proj_bias)
         qkv = qkv.view(B, L, H * 3, -1).permute(0, 2, 1, 3)
         q, k, v = qkv.split([H, H, H], dim=1)
-        out = F.scaled_dot_product_attention(q, k, v)
+        out = F._scaled_dot_product_attention(q, k, v)[0]
         out = out.permute(0, 2, 1, 3).flatten(-2)
         out = self.attn.out_proj(out)
 
@@ -137,6 +187,7 @@ class Transformer(nn.Module):
                  adapter_kernel_size: Tuple[int, int, int],
                  adapter_pre_attn: bool,
                  adapter_pre_mlp: bool,
+                 qrnn_adapter: bool,
                  ):
         super().__init__()
         self.width = width
@@ -149,6 +200,7 @@ class Transformer(nn.Module):
                 adapter_kernel_size=adapter_kernel_size,
                 adapter_pre_attn=adapter_pre_attn and i >= layers - adapter_layers,
                 adapter_pre_mlp=adapter_pre_mlp and i >= layers - adapter_layers,
+                qrnn_adapter=qrnn_adapter,
             )
             for i in range(layers)
         ])
@@ -172,6 +224,8 @@ class VisionTransformer(nn.Module):
                  adapter_kernel_size: Tuple[int, int, int],
                  adapter_pre_attn: bool,
                  adapter_pre_mlp: bool,
+                 qrnn_adapter: bool,
+                 frozen_precision: int,
                  ):
         super().__init__()
         self.input_resolution = input_resolution
@@ -189,14 +243,15 @@ class VisionTransformer(nn.Module):
 
         self.transformer = Transformer(width, layers, heads,
             adapter_width, adapter_layers, adapter_kernel_size,
-            adapter_pre_attn, adapter_pre_mlp)
+            adapter_pre_attn, adapter_pre_mlp, qrnn_adapter)
 
         self.ln_post = LayerNorm(width)
 
         for n, p in self.named_parameters():
           if 'adapter' not in n:
             p.requires_grad_(False)
-            p.data = p.data.half()
+            if frozen_precision == 16:
+                p.data = p.data.half()
         
         self.dropout = nn.Dropout(0.5)
         self.fc = nn.Linear(width, num_classes)
@@ -242,6 +297,7 @@ def clip_vit_base_patch16_adapter24x384(**kwargs):
         adapter_kernel_size=(3, 1, 1),
         adapter_pre_attn=True,
         adapter_pre_mlp=True,
+        qrnn_adapter=False,
         **kwargs,
     )
     assert CLIP_VIT_B16_PATH is not None, \
@@ -266,6 +322,27 @@ def clip_vit_base_patch16_adapter12x384(**kwargs):
     )
     assert CLIP_VIT_B16_PATH is not None, \
         'Please set CLIP_VIT_B16_PATH in configs.py'
+    checkpoint = torch.jit.load(CLIP_VIT_B16_PATH, map_location='cpu')
+    print(model.load_state_dict(checkpoint.visual.state_dict(), strict=False))
+    return model
+
+def clip_vit_base_patch16_qrnnadapter24x384(**kwargs):
+    model = VisionTransformer(
+        input_resolution=224,
+        patch_size=16,
+        width=768,
+        layers=12,
+        heads=12,
+        adapter_width=384,
+        adapter_layers=12,
+        adapter_kernel_size=(3, 1, 1),
+        adapter_pre_attn=True,
+        adapter_pre_mlp=True,
+        qrnn_adapter=True,
+        **kwargs,
+    )
+    assert CLIP_VIT_B16_PATH is not None, \
+        'Please set CLIP_VIT_B16_PATH in configs.py.'
     checkpoint = torch.jit.load(CLIP_VIT_B16_PATH, map_location='cpu')
     print(model.load_state_dict(checkpoint.visual.state_dict(), strict=False))
     return model

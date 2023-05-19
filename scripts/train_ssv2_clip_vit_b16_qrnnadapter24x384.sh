@@ -1,8 +1,8 @@
 #!/usr/bin/env sh
 
-torchrun --nproc_per_node 8 main.py \
-    --model clip_vit_base_patch16_adapter24x384 \
-    --save_dir output_dir/ssv2/clip_vit_base_patch16_adapter24x384_5 \
+torchrun --nproc_per_node 4 main.py \
+    --model clip_vit_base_patch16_qrnnadapter24x384 \
+    --save_dir output_dir/ssv2/clip_vit_base_patch16_qrnnadapter24x384 \
     --auto_resume --auto_remove \
     --dataset ssv2 \
     --num_frames 8 \
@@ -15,5 +15,5 @@ torchrun --nproc_per_node 8 main.py \
     --warmup_epochs 2 \
     --eval_freq 5 \
     --frozen_precision 32 \
-    --grad_acc_steps 2 \
-    --wandb_group st-adapter-full-prec-grad-acc-fixed-3
+    --grad_acc_steps 4 \
+    --wandb_group st-adapter-qrnn-full-prec-grad-acc-fixed

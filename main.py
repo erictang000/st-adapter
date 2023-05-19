@@ -12,6 +12,7 @@ import models_adapter
 from video_dataset import VideoDataset
 from configs import DATASETS
 
+import wandb
 
 def main():
   parser = argparse.ArgumentParser()
@@ -78,8 +79,16 @@ def main():
       help='print a log message every N training steps.')
   parser.add_argument('--eval_freq', type=int, default=1, metavar='N',
       help='evaluate on the validation set every N epochs.')
+  parser.add_argument('--grad_acc_steps', type=int, default=1)
+  parser.add_argument('--wandb_group', type=str, default='st-adapter_test')
+  parser.add_argument('--frozen_precision', type=int, default=16, choices=[16, 32])
 
   args = parser.parse_args()
+  wandb.init(project="leaky_video",
+            entity="erictang000",
+            name="ssv2_vit-b-16",
+            group=args.wandb_group,)
+
 
   dist.init_process_group('nccl')
   gpu_id = dist.get_rank() % torch.cuda.device_count()
@@ -89,7 +98,7 @@ def main():
   print("{}".format(args).replace(', ', ',\n'))
 
   print('creating model')
-  model = models_adapter.__dict__[args.model](num_classes=DATASETS[args.dataset]['NUM_CLASSES']).cuda().train()
+  model = models_adapter.__dict__[args.model](num_classes=DATASETS[args.dataset]['NUM_CLASSES'], frozen_precision=args.frozen_precision).cuda().train()
   n_trainable_params = 0
   for n, p in model.named_parameters():
     if p.requires_grad:
@@ -151,7 +160,7 @@ def main():
       print('using absolute lr:', args.lr)
     else:
       print('using relative lr (per 256 samples):', args.blr)
-      args.lr = args.blr * args.batch_size * dist.get_world_size() / 256
+      args.lr = args.blr * args.batch_size * args.grad_acc_steps * dist.get_world_size() / 256
       print('effective lr:', args.lr)
     
     params_with_decay, params_without_decay = [], []
@@ -170,9 +179,10 @@ def main():
         )
     print(optimizer)
     loss_scaler = torch.cuda.amp.GradScaler()
+    grad_acc_steps = args.grad_acc_steps
     
     def lr_func(step):
-      epoch = step / len(dataloader_train)
+      epoch = step * grad_acc_steps / len(dataloader_train)
       if epoch < args.warmup_epochs:
         return epoch / args.warmup_epochs
       else:
@@ -187,7 +197,16 @@ def main():
       data, labels = data.cuda(), labels.cuda()
       B, V = data.size(0), data.size(1)
       data = data.flatten(0, 1)
-      with torch.cuda.amp.autocast():
+      if args.frozen_precision == 16:
+        with torch.cuda.amp.autocast():
+          with model.no_sync():
+            with torch.no_grad():
+              logits = model(data)
+          scores = logits.softmax(dim=-1)
+          scores = scores.view(B, V, -1).mean(dim=1)
+          acc1 = (scores.topk(1, dim=1)[1] == labels.view(-1, 1)).sum(dim=-1).float().mean().item() * 100
+          acc5 = (scores.topk(5, dim=1)[1] == labels.view(-1, 1)).sum(dim=-1).float().mean().item() * 100
+      else:
         with model.no_sync():
           with torch.no_grad():
             logits = model(data)
@@ -200,6 +219,7 @@ def main():
     metric_logger.synchronize_between_processes()
     print('* Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f}'
         .format(top1=metric_logger.acc1, top5=metric_logger.acc5))
+    wandb.log({'val_acc1': metric_logger.acc1.global_avg, 'val_acc5': metric_logger.acc5.global_avg})
     if log_stats is not None:
       log_stats.update({'val_' + k: meter.global_avg for k, meter in metric_logger.meters.items()})
 
@@ -218,22 +238,40 @@ def main():
     model.train()
     for step, (data, labels) in enumerate(metric_logger.log_every(dataloader_train, args.print_freq, header)):
       data, labels = data.cuda(), labels.cuda()
-      optimizer.zero_grad()
-      with torch.cuda.amp.autocast():
-        logits = model(data)
-        acc1 = (logits.topk(1, dim=1)[1] == labels.view(-1, 1)).sum(dim=-1).float().mean().item() * 100
-        acc5 = (logits.topk(5, dim=1)[1] == labels.view(-1, 1)).sum(dim=-1).float().mean().item() * 100
-        loss = F.cross_entropy(logits, labels)
-      loss_scaler.scale(loss).backward()
-      loss_scaler.step(optimizer)
-      lr_sched.step()
-      loss_scaler.update()
+      if args.frozen_precision == 16:
+        with torch.cuda.amp.autocast():
+          logits = model(data)
+          acc1 = (logits.topk(1, dim=1)[1] == labels.view(-1, 1)).sum(dim=-1).float().mean().item() * 100
+          acc5 = (logits.topk(5, dim=1)[1] == labels.view(-1, 1)).sum(dim=-1).float().mean().item() * 100
+          loss = F.cross_entropy(logits, labels) / grad_acc_steps
+      else:
+        if step % grad_acc_steps == 0:
+          logits = model(data)
+          acc1 = (logits.topk(1, dim=1)[1] == labels.view(-1, 1)).sum(dim=-1).float().mean().item() * 100
+          acc5 = (logits.topk(5, dim=1)[1] == labels.view(-1, 1)).sum(dim=-1).float().mean().item() * 100
+          loss = F.cross_entropy(logits, labels) / grad_acc_steps
+          loss_scaler.scale(loss).backward()
+        else:
+          with model.no_sync():
+            logits = model(data)
+            acc1 = (logits.topk(1, dim=1)[1] == labels.view(-1, 1)).sum(dim=-1).float().mean().item() * 100
+            acc5 = (logits.topk(5, dim=1)[1] == labels.view(-1, 1)).sum(dim=-1).float().mean().item() * 100
+            loss = F.cross_entropy(logits, labels) / grad_acc_steps
+            loss_scaler.scale(loss).backward()
+      if step % grad_acc_steps == 0:
+        loss_scaler.step(optimizer)
+        optimizer.zero_grad()
+        lr_sched.step()
+        loss_scaler.update()
 
       metric_logger.update(
-          loss=loss.item(),
+          loss=loss.item() * grad_acc_steps,
           lr=optimizer.param_groups[0]['lr'],
           acc1=acc1, acc5=acc5,
           )
+      
+      if step % (args.print_freq * grad_acc_steps) == 0:
+        wandb.log({'train_loss': loss.item() * grad_acc_steps, 'train_acc1': acc1, 'train_acc5': acc5, 'lr': optimizer.param_groups[0]['lr']})
 
     print('Averaged stats:', metric_logger)
     log_stats = {'train_' + k: meter.global_avg for k, meter in metric_logger.meters.items()}
